@@ -1,0 +1,5 @@
+torch==1.4.0
+gdown 
+transformers==2.8.0 
+filelock 
+nltk
