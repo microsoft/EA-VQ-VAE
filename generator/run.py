@@ -281,7 +281,7 @@ def train(args,config,tokenizer,model):
             overall_bleu=0
             overall_dist=[]
             for c in category:
-                bleu,dist=test(args,config,tokenizer,model,os.path.join(args.data_dir, 'gen-dev.pkl'),c,10,1000//len(category))
+                bleu,dist=test(args,config,tokenizer,model,os.path.join(args.data_dir, 'gen-dev.pkl'),c,10,1000)
                 result[c+' (bleu,dist1,dist2)']=[bleu,dist1(dist),dist2(dist)]
                 result[c+' (bleu,dist1,dist2)']=' '.join([str(x) for x in result[c+' (bleu,dist1,dist2)']])
                 overall_bleu+=bleu
