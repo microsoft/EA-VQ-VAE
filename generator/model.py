@@ -31,6 +31,7 @@ class Model(nn.Module):
         self.config=config
         self.args=args
         
+        self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)     
         self.lsm = nn.LogSoftmax(dim=-1)
         
@@ -83,7 +84,7 @@ class Model(nn.Module):
         context_ids_all=context_ids
         context_ids=context_ids.view(-1,le)
         embeds=self.embeddings(context_ids).permute([1,0,2]).contiguous()
-        c=self.encoder(embeds)[-1].view(bs,cx,-1)
+        c=self.ln_f(self.encoder(embeds)[-1]).view(bs,cx,-1)
         
         # select nearest context 
         distances = ((c-z[:,None,:])**2).sum(-1)      
@@ -152,7 +153,7 @@ class Model(nn.Module):
             bs,cx,le=context_ids.shape
             context_ids=context_ids.view(-1,le)
             embeds=self.embeddings(context_ids).permute([1,0,2]).contiguous()
-            c=self.encoder(embeds)[-1].view(bs,cx,-1)
+            c=self.ln_f(self.encoder(embeds)[-1]).view(bs,cx,-1)
             
             #obtain evidence selected by latent variable
             distances = ((c-z[:,None,:])**2).sum(-1)      
