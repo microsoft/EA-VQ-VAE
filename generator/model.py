@@ -31,7 +31,6 @@ class Model(nn.Module):
         self.config=config
         self.args=args
         
-        self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)     
         self.lsm = nn.LogSoftmax(dim=-1)
         
@@ -39,28 +38,7 @@ class Model(nn.Module):
         self.max_length=args.max_target_length
         self.sos_id=sos_id
         self.eos_id=eos_id
-        self.tie_weights()
-        
-    def _tie_or_clone_weights(self, first_module, second_module):
-        """ Tie or clone module weights depending of weither we are using TorchScript or not
-        """
-        if self.config.torchscript:
-            first_module.weight = nn.Parameter(second_module.weight.clone())
-        else:
-            first_module.weight = second_module.weight
-                  
-    def tie_weights(self):
-        """ Make sure we are sharing the input and output embeddings.
-            Export to TorchScript can't handle parameter sharing so we are cloning them instead.
-        """
-        self._tie_or_clone_weights(self.lm_head,
-                                   self.decoder.transformer.wte)        
-    def embeddings(self, input_ids):
-        position_ids = torch.arange(0, input_ids.shape[-1], dtype=torch.long, device=input_ids.device)
-        input_embeds=self.decoder.transformer.wte(input_ids)
-        position_embeds=self.decoder.transformer.wpe(position_ids)      
-        input_embeds=input_embeds+position_embeds.unsqueeze(0)    
-        return input_embeds    
+        self.lm_head.weight=self.decoder.wte.weight       
         
     def forward(self, event_ids,context_ids,target_ids=None,posterior=None,prior=None,topk=None):   
         """
@@ -83,8 +61,7 @@ class Model(nn.Module):
         bs,cx,le=context_ids.shape
         context_ids_all=context_ids
         context_ids=context_ids.view(-1,le)
-        embeds=self.embeddings(context_ids).permute([1,0,2]).contiguous()
-        c=self.ln_f(self.encoder(embeds)[-1]).view(bs,cx,-1)
+        c=self.encoder(context_ids)[0][:,-1].view(bs,cx,-1)
         
         # select nearest context 
         distances = ((c-z[:,None,:])**2).sum(-1)      
@@ -105,7 +82,7 @@ class Model(nn.Module):
         
         #calculate probability of target given empty context
         inputs_ids=torch.cat((context_ids_random,event_ids,target_ids),-1)
-        hidden_states=self.decoder.transformer(inputs_ids)[0][:,-target_ids.size(1):]
+        hidden_states=self.decoder(inputs_ids)[0][:,-target_ids.size(1):]
         lm_logits = self.lsm(self.lm_head(hidden_states))
         labels_logits=lm_logits[:,:-1].gather(-1,target_ids[:,1:].unsqueeze(-1))[:,:,0]
         active_loss=target_ids.ne(0)[:,1:]
@@ -114,14 +91,14 @@ class Model(nn.Module):
 
          #calculate probability of target given selected context
         inputs_ids=torch.cat((context_ids,event_ids,target_ids),-1)
-        hidden_states=self.decoder.transformer(inputs_ids)[0][:,-target_ids.size(1):]        
+        hidden_states=self.decoder(inputs_ids)[0][:,-target_ids.size(1):]        
         lm_logits = self.lsm(self.lm_head(hidden_states))            
         labels_logits=lm_logits[:,:-1].gather(-1,target_ids[:,1:].unsqueeze(-1))[:,:,0]
         active_loss=target_ids.ne(0)[:,1:]
         sm_prob=labels_logits*active_loss.float()     
         prob_2=torch.exp(sm_prob.sum(1))  
 
-        
+
         # calculate target loss
         active_loss = target_ids[..., 1:].ne(0).view(-1) == 1
         shift_logits = lm_logits[..., :-1, :].contiguous()
@@ -152,23 +129,19 @@ class Model(nn.Module):
             context_ids=context_ids_all[i:i+1].repeat(topk,1,1)
             bs,cx,le=context_ids.shape
             context_ids=context_ids.view(-1,le)
-            embeds=self.embeddings(context_ids).permute([1,0,2]).contiguous()
-            c=self.ln_f(self.encoder(embeds)[-1]).view(bs,cx,-1)
+            c=self.encoder(context_ids)[0][:,-1].view(bs,cx,-1)
             
             #obtain evidence selected by latent variable
             distances = ((c-z[:,None,:])**2).sum(-1)      
             encoding_indices = torch.argmin(distances, dim=1)
             encodings = F.one_hot(encoding_indices,cx)
-            c=(c*encodings[:,:,None].float()).sum(1)
-            context_loss = torch.mean((c - z)**2)
             context_ids=(context_ids.view(bs,cx,le)*encodings[:,:,None].long()).sum(1)
             ############################################################################    
             #concatenate evidence and event to obtain hidden states
             inputs_ids=torch.cat((context_ids,event_ids[i:i+1].repeat(topk,1)),-1)
-            transformer_outputs=self.decoder.transformer(inputs_ids)
+            transformer_outputs=self.decoder(inputs_ids)
             past_x=[x.repeat(1,self.beam_size,1,1,1) for x in transformer_outputs[1]]
             z=z.repeat(self.beam_size,1)
-            past_inputs=inputs_ids.repeat(self.beam_size,1)
             ############################################################################  
             
             #beam search
@@ -182,7 +155,7 @@ class Model(nn.Module):
                     input_ids=torch.cat((input_ids,beam.getCurrentState()),-1)
 
                 target_ids=input_ids.unsqueeze(1).repeat(1,topk,1).view(-1,input_ids.shape[-1])
-                transformer_outputs=self.decoder.transformer(target_ids,past=past_x)
+                transformer_outputs=self.decoder(target_ids,past=past_x)
                 hidden_states = transformer_outputs[0]   
 
                 out = self.lsm(self.lm_head(hidden_states[:,-1,:])).data

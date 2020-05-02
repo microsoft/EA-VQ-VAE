@@ -1,5 +1,23 @@
-# Copyright (c) Microsoft Corporation. 
-# Licensed under the MIT license.
+# coding=utf-8
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
+# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Fine-tuning the library models for language modeling on a text file (GPT, GPT-2, BERT, RoBERTa).
+GPT and GPT-2 are fine-tuned using a causal language modeling (CLM) loss while BERT and RoBERTa are fine-tuned
+using a masked language modeling (MLM) loss.
+"""
 
 from __future__ import absolute_import
 import os
@@ -17,7 +35,7 @@ from tqdm import tqdm, trange
 from nltk.tokenize import WordPunctTokenizer
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
 from torch.utils.data.distributed import DistributedSampler
-from transformers import AdamW, GPT2Config, GPT2LMHeadModel, GPT2Tokenizer, get_linear_schedule_with_warmup
+from transformers import AdamW, GPT2Config, GPT2Model, GPT2Tokenizer, get_linear_schedule_with_warmup
 from model import Model
 from nltk.tokenize import WordPunctTokenizer
 from nltk import bleu
@@ -101,33 +119,32 @@ def convert_examples_to_features(examples, tokenizer, args,stage=None):
     """convert examples to tensor feature"""
     evidences=json.load(open(os.path.join('../data','evidence.json')))
     try:
-        evidences_tokens=pickle.load(open(os.path.join('../data','evidence_tokens_{}.pkl').format(args.max_evidence_length),'rb'))
+        evidences_tokens=pickle.load(open(os.path.join('../data','evidence_tokens.pkl'),'rb'))
     except:
         evidences_tokens={}
         for key in tqdm(evidences,total=len(evidences)):
             for evidence in evidences[key]:
-                evidences_tokens[evidence]=tokenizer.convert_tokens_to_ids(tokenizer.tokenize(evidence)[:args.max_evidence_length])
-                padding_length = args.max_evidence_length - len(evidences_tokens[evidence])
-                evidences_tokens[evidence]+=[0] * padding_length
-                evidences_tokens["None"]=[0]*args.max_evidence_length             
-        pickle.dump(evidences_tokens,open(os.path.join('../data','evidence_tokens_{}.pkl').format(args.max_evidence_length),'wb'))             
+                evidences_tokens[evidence]=tokenizer.convert_tokens_to_ids(tokenizer.tokenize(evidence))
+                evidences_tokens["None"]=tokenizer.convert_tokens_to_ids(tokenizer.tokenize("None"))          
+        pickle.dump(evidences_tokens,open(os.path.join('../data','evidence_tokens.pkl'),'wb'))             
     features = []
     for idx, example in tqdm(enumerate(examples),total=len(examples)) if stage=="training" else  enumerate(examples):
         #event
-        event_tokens = tokenizer.tokenize(example.category+" "+example.event)[:args.max_event_length-1]
+        event_tokens = tokenizer.tokenize(example.category+" ### "+example.event+" ### "+example.category)[:args.max_event_length]
         event_ids = tokenizer.convert_tokens_to_ids(event_tokens)
         padding_length = args.max_event_length - len(event_ids)
         event_ids+=[0]*padding_length        
         posterior=int(example.posterior)
         prior=example.prior
         
-        context=[]
-        for x in evidences[example.event]:
-            if x not in context and len(context)<args.num_evidence:
-                context.append(x)
-        context=context+["None"]*(args.num_evidence-len(context)+1)
-        context_ids=[evidences_tokens[c] for c in context]
-
+        
+        cat_begin=tokenizer.convert_tokens_to_ids(tokenizer.tokenize(example.category+"###"))
+        cat_end=tokenizer.convert_tokens_to_ids(tokenizer.tokenize("###"+example.category))
+        trunc_length=len(cat_begin)+len(cat_begin)
+        context=evidences[example.event][:args.num_evidence]
+        context=evidences[example.event]+["None"]*(args.num_evidence-len(context)+1)
+        context_ids=[cat_begin+evidences_tokens[c][:args.max_evidence_length-trunc_length]+cat_end for c in context]
+        context_ids=[c+[0]*(args.max_evidence_length-len(c)) for c in context_ids]
         
         #target
         if stage=="test":
@@ -143,12 +160,12 @@ def convert_examples_to_features(examples, tokenizer, args,stage=None):
         assert len(target_ids) == args.max_target_length
 
         if idx < 5:
-            if stage=='training' or stage=="test":
+            if stage=='training':
                 logger.info("*** Example ***")
                 logger.info("idx: {}".format(example.idx))
-                logger.info("vent_tokens: {}".format(event_tokens))
+                logger.info("event_tokens: {}".format(event_tokens))
                 logger.info("event_ids: {}".format(' '.join(map(str, event_ids))))  
-                for i in range(5):
+                for i in range(2):
                     logger.info("context_text {}: {}".format(i,context[i]))
                     logger.info("context_ids {}: {}".format(i,context_ids[i]))
                 logger.info("target_tokens: {}".format(target_tokens))
@@ -276,12 +293,15 @@ def train(args,config,tokenizer,model):
         #Running evaluation
         if ((global_step + 1) %args.eval_steps == 0) and eval_flag:
             tr_re_loss,tr_context_loss,tr_reward,tr_clf_loss,nb_tr_examples, nb_tr_steps,eval_flag = 0,0,0,0,0,0,False
-            result=evaluate(args,config,tokenizer,model,os.path.join(args.data_dir, 'ppl-dev.pkl'))
-            category=set([e.category for e in train_examples])
+            result=evaluate(args,config,tokenizer,model,os.path.join(args.data_dir, 'ppl-dev.pkl'),num_sample=10000)
+            if 'event2mind' in args.data_dir:
+                category = ["<oReact>","<xIntent>","<xReact>"]
+            else:
+                category = ["<oEffect>","<oReact>","<oWant>","<xAttr>","<xEffect>","<xIntent>","<xNeed>","<xReact>","<xWant>"]
             overall_bleu=0
             overall_dist=[]
             for c in category:
-                bleu,dist=test(args,config,tokenizer,model,os.path.join(args.data_dir, 'gen-dev.pkl'),c,10,1000)
+                bleu,dist=test(args,config,tokenizer,model,os.path.join(args.data_dir, 'gen-dev.pkl'),c,10,3000//len(category))
                 result[c+' (bleu,dist1,dist2)']=[bleu,dist1(dist),dist2(dist)]
                 result[c+' (bleu,dist1,dist2)']=' '.join([str(x) for x in result[c+' (bleu,dist1,dist2)']])
                 overall_bleu+=bleu
@@ -297,7 +317,7 @@ def train(args,config,tokenizer,model):
                 logger.info("  %s = %s", key, str(result[key]))
             logger.info("  "+"*"*20)    
 
-            if overall_bleu>best_bleu:
+            if overall_bleu>=best_bleu:
                 logger.info("  Best bleu:%s",overall_bleu)
                 logger.info("  "+"*"*20)
                 best_bleu=overall_bleu
@@ -307,7 +327,7 @@ def train(args,config,tokenizer,model):
                 torch.save(model_to_save.state_dict(), output_model_file)
                 
 evaluate_dataset={}                
-def evaluate(args,config,tokenizer,model,filename):            
+def evaluate(args,config,tokenizer,model,filename,num_sample=None):            
     #Load and prepare data
     if filename in evaluate_dataset:
         eval_examples,eval_dataloader=evaluate_dataset[filename]
@@ -315,6 +335,8 @@ def evaluate(args,config,tokenizer,model,filename):
         flag='dev' if 'dev' in filename else 'tst'
         posterior_dic=pickle.load(open(os.path.join(args.posterior_dir, 'posterior-{}.pkl').format(flag),'rb'))
         eval_examples = read_examples(filename,posterior_dic=posterior_dic)
+        if num_sample is not None:
+            eval_examples = random.sample(eval_examples,num_sample)        
         eval_features = convert_examples_to_features(eval_examples, tokenizer, args,stage='dev')
         all_event_ids = torch.tensor([f.event_ids for f in eval_features], dtype=torch.long)
         all_context_ids = torch.tensor([f.context_ids for f in eval_features], dtype=torch.long)
@@ -526,17 +548,18 @@ def main():
 
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
     config = GPT2Config.from_pretrained(args.model_name_or_path)
-    decoder = GPT2LMHeadModel.from_pretrained(args.model_name_or_path,config=config)
-    encoder_layer = nn.TransformerEncoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
-    encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)    
+    decoder = GPT2Model.from_pretrained(args.model_name_or_path,config=config)
+    import copy
+    config_encoder=copy.deepcopy(config)
+    config_encoder.n_layer=2
+    encoder = GPT2Model(config=config_encoder)       
     codebook=nn.Embedding(args.z_size,config.n_embd)
     codebook.load_state_dict(torch.load(args.codebook_path))
-    model = Model(encoder,decoder,codebook,config,args,sos_id=tokenizer.convert_tokens_to_ids(["##"])[0],eos_id=tokenizer.convert_tokens_to_ids(["</s>"])[0])
+    model = Model(encoder,decoder,codebook,config,args,sos_id=2235,eos_id=50256)
     if args.load_model_path is not None:
         logger.info("Load model from %s",args.load_model_path)
         model.load_state_dict(torch.load(args.load_model_path))
-        
-    logger.info("Training/evaluation parameters %s", args)         
+    logger.info("Training/evaluation parameters %s", args)        
     if args.fp16:
         model.half()
     model.to(device)
@@ -562,7 +585,7 @@ def main():
             best_bleu=0
             topk_dic[cat]=5
             for topk in range(5,16):
-                bleu,_=test(args,config,tokenizer,model,os.path.join(args.data_dir, 'gen-dev.pkl'),cat,topk,100)
+                bleu,_=test(args,config,tokenizer,model,os.path.join(args.data_dir, 'gen-dev.pkl'),cat,topk,200)
                 logger.info("  {} (topk bleu-2): {} {}".format(cat,topk,bleu))
                 if bleu>=best_bleu:
                     best_bleu=bleu
@@ -576,23 +599,24 @@ def main():
     if args.do_test:
         logger.info("Load topk latent variables from %s",os.path.join(args.output_dir, "topk.pkl"))  
         topk_dic=pickle.load(open(os.path.join(args.output_dir, "topk.pkl"),'rb'))
-        result={}
-        overall_bleu=0
-        overall_dist=[]
-        for c in topk_dic:
-            bleu,dist=test(args,config,tokenizer,model,os.path.join(args.data_dir, 'gen-tst.pkl'),c,topk_dic[c],None)
-            result[c+' (bleu-2,dist1,dist2)']=[bleu,dist1(dist),dist2(dist)]
-            result[c+' (bleu-2,dist1,dist2)']=' '.join([str(x) for x in result[c+' (bleu-2,dist1,dist2)']])
-            overall_bleu+=bleu
-            overall_dist+=dist
-        overall_bleu=round(overall_bleu/len(topk_dic),2)
-        result['Overall (bleu-2,dist1,dist2)']=[overall_bleu,dist1(overall_dist),dist2(overall_dist)]
-        result['Overall (bleu-2,dist1,dist2)']=' '.join([str(x) for x in result['Overall (bleu-2,dist1,dist2)']])
-        logger.info("***** Result *****")
-        #print result
-        for key in sorted(result.keys()):
-            logger.info("  %s = %s", key, str(result[key]))
-        logger.info("  "+"*"*20)       
+        for flag in ['dev','tst']:
+            result={}
+            overall_bleu=0
+            overall_dist=[]
+            for c in topk_dic:
+                bleu,dist=test(args,config,tokenizer,model,os.path.join(args.data_dir,'gen-{}.pkl'.format(flag)),c,topk_dic[c])
+                result[c+' (bleu-2,dist1,dist2)']=[bleu,dist1(dist),dist2(dist)]
+                result[c+' (bleu-2,dist1,dist2)']=' '.join([str(x) for x in result[c+' (bleu-2,dist1,dist2)']])
+                overall_bleu+=bleu
+                overall_dist+=dist
+            overall_bleu=round(overall_bleu/len(topk_dic),2)
+            result['Overall (bleu-2,dist1,dist2)']=[overall_bleu,dist1(overall_dist),dist2(overall_dist)]
+            result['Overall (bleu-2,dist1,dist2)']=' '.join([str(x) for x in result['Overall (bleu-2,dist1,dist2)']])
+            logger.info("***** Result:{} *****".format(flag))
+            #print result
+            for key in sorted(result.keys()):
+                logger.info("  %s = %s", key, str(result[key]))
+            logger.info("  "+"*"*20)       
         
                 
 if __name__ == "__main__":

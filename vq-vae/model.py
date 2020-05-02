@@ -6,7 +6,42 @@ import torch.nn as nn
 from torch.autograd import Variable
 import copy
 from torch.nn import CrossEntropyLoss
-from codebook import CodeBook
+
+class CodeBook(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost):
+        super(CodeBook, self).__init__()  
+        self._embedding_dim = embedding_dim
+        self._num_embeddings = num_embeddings     
+        self._embedding = nn.Embedding(self._num_embeddings, self._embedding_dim)      
+        self._commitment_cost = commitment_cost
+
+    def forward(self, inputs):
+        # Calculate distances
+        distances = (torch.sum(inputs**2, dim=1, keepdim=True) 
+                    + torch.sum(self._embedding.weight**2, dim=1)
+                    - 2 * torch.matmul(inputs, self._embedding.weight.t()))
+            
+        # Encoding
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        encodings = torch.zeros(encoding_indices.shape[0], self._num_embeddings).cuda()
+        encodings.scatter_(1, encoding_indices, 1)
+        
+        # Quantize and unflatten
+        quantized = torch.matmul(encodings, self._embedding.weight)
+        
+        # Loss
+        e_latent_loss = torch.mean((quantized.detach() - inputs)**2)
+        q_latent_loss = torch.mean((quantized - inputs.detach())**2)
+        loss = q_latent_loss + self._commitment_cost * e_latent_loss
+        
+        quantized = inputs + (quantized - inputs).detach()
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        
+        # convert quantized from BHWC -> BCHW
+        return loss, quantized, perplexity, encodings
+    
+
 class Model(nn.Module):
     """
         Build Seqence-to-Sequence.
@@ -25,35 +60,12 @@ class Model(nn.Module):
         self.config=config
         self.args=args
         
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)      
         self.codebook = CodeBook(args.z_size, config.n_embd,0.25)  
         self.codebook._embedding.weight.data.normal_(mean=0,std=0.1)
         self.lsm = nn.LogSoftmax(dim=-1)
-        
-        self.tie_weights()
-        
-    def _tie_or_clone_weights(self, first_module, second_module):
-        """ Tie or clone module weights depending of weither we are using TorchScript or not
-        """
-        if self.config.torchscript:
-            first_module.weight = nn.Parameter(second_module.weight.clone())
-        else:
-            first_module.weight = second_module.weight
-                  
-    def tie_weights(self):
-        """ Make sure we are sharing the input and output embeddings.
-            Export to TorchScript can't handle parameter sharing so we are cloning them instead.
-        """
-        self._tie_or_clone_weights(self.lm_head,
-                                   self.decoder.transformer.wte)        
+        self.lm_head.weight=self.decoder.wte.weight     
     
-    def embeddings(self, input_ids,z):
-        position_ids = torch.arange(0, input_ids.shape[-1], dtype=torch.long, device=input_ids.device)
-        input_embeds=self.decoder.transformer.wte(input_ids)
-        position_embeds=self.decoder.transformer.wpe(position_ids)       
-        input_embeds=input_embeds+position_embeds.unsqueeze(0)+z.unsqueeze(1)     
-        return input_embeds
-        
     def forward(self, event_ids,target_ids):   
         """
             Forward the VQ-VAE model.
@@ -63,22 +75,21 @@ class Model(nn.Module):
         """  
         input_ids=torch.cat((event_ids,target_ids),-1)
         #obtain hidden of event+target by encoder
-        hidden_xy=self.encoder.transformer(input_ids)[0][:,-1]
+        hidden_xy=self.encoder(input_ids,special=True)[0][:,-1]
 
         #obtain latent variable z by coodebook
         vae_loss, z, perplexity, encoding=self.codebook(hidden_xy)
 
         #obtain hiddens of target 
-        embeds=self.embeddings(input_ids,z=z)
-        transformer_outputs=self.decoder.transformer(inputs_embeds=embeds)
+        transformer_outputs=self.decoder(inputs_embeds=self.decoder.wte(input_ids),z=z)
         hidden_states = transformer_outputs[0][:,-target_ids.size(1):]
 
         #calculate loss
         lm_logits = self.lm_head(hidden_states)
         # Shift so that tokens < n predict n
-        active_loss = target_ids[..., 1:-1].ne(0).view(-1) == 1
-        shift_logits = lm_logits[..., :-2, :].contiguous()
-        shift_labels = target_ids[..., 1:-1].contiguous()
+        active_loss = target_ids[..., 1:].ne(0).view(-1) == 1
+        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_labels = target_ids[..., 1:].contiguous()
         # Flatten the tokens
         loss_fct = CrossEntropyLoss(ignore_index=-1)
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1))[active_loss],

@@ -1,5 +1,23 @@
-# Copyright (c) Microsoft Corporation. 
-# Licensed under the MIT license.
+# coding=utf-8
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
+# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Fine-tuning the library models for language modeling on a text file (GPT, GPT-2, BERT, RoBERTa).
+GPT and GPT-2 are fine-tuned using a causal language modeling (CLM) loss while BERT and RoBERTa are fine-tuned
+using a masked language modeling (MLM) loss.
+"""
 
 from __future__ import absolute_import
 import os
@@ -17,7 +35,8 @@ from tqdm import tqdm, trange
 from nltk.tokenize import WordPunctTokenizer
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
 from torch.utils.data.distributed import DistributedSampler
-from transformers import AdamW, GPT2Config, GPT2LMHeadModel, GPT2Tokenizer, get_linear_schedule_with_warmup
+from transformers import AdamW, GPT2Tokenizer, get_linear_schedule_with_warmup
+from gpt2 import GPT2Config, GPT2Model
 from model import Model
 logger = logging.getLogger(__name__)
 
@@ -64,7 +83,7 @@ def convert_examples_to_features(examples, tokenizer, args,stage=None):
     features = []
     for idx, example in tqdm(enumerate(examples),total=len(examples)) if stage=="training" else  enumerate(examples):
         #event
-        event_tokens = tokenizer.tokenize(example.category+" "+example.event)[:args.max_event_length-1]
+        event_tokens = tokenizer.tokenize(example.category+" ### "+example.event+" ### "+example.category)[:args.max_event_length]
         event_ids = tokenizer.convert_tokens_to_ids(event_tokens)
         padding_length = args.max_event_length - len(event_ids)
         event_ids+=[0]*padding_length        
@@ -75,7 +94,7 @@ def convert_examples_to_features(examples, tokenizer, args,stage=None):
         else:
             target_tokens = tokenizer.tokenize(example.target)[:args.max_target_length - 2]
     
-        target_tokens = ['<s>']+target_tokens+["</s>"]            
+        target_tokens = ['##']+target_tokens+["</s>"]            
         target_ids = tokenizer.convert_tokens_to_ids(target_tokens)
         padding_length = args.max_target_length - len(target_ids)
         target_ids+=[0]*padding_length
@@ -383,14 +402,17 @@ def main():
 
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
     config = GPT2Config.from_pretrained(args.model_name_or_path)
-    decoder = GPT2LMHeadModel.from_pretrained(args.model_name_or_path,config=config)
-    encoder = GPT2LMHeadModel.from_pretrained(args.model_name_or_path,config=config) 
+    decoder = GPT2Model.from_pretrained(args.model_name_or_path,config=config)
+    import copy
+    config_encoder=copy.deepcopy(config)
+    config_encoder.n_layer=2
+    encoder = GPT2Model(config=config_encoder)    
     model = Model(encoder,decoder,config,args)
         
     if args.load_model_path is not None:
         logger.info("Load model from %s",args.load_model_path)
         model.load_state_dict(torch.load(args.load_model_path))
-    logger.info("Training/evaluation parameters %s", args)     
+        
     if args.fp16:
         model.half()
     model.to(device)

@@ -51,7 +51,7 @@ We first train VQ-VAE with the posterior distribution p(z|x,y).
 ```shell
 cd vq-vae
 task=event2mind #event2mind or atomic
-train_steps=10000 #10000 for event2mind and 20000 for atomic
+train_steps=10000 #10000 for event2mind and 50000 for atomic
 mkdir -p log model/$task
 CUDA_VISIBLE_DEVICES=0,1,2,3 python run.py \
 --model_name_or_path gpt2 \
@@ -135,8 +135,8 @@ We finally jointly learn the context distribution p(c|z) and the generator p(y|x
 ```shell
 cd ../generator
 task=event2mind #event2mind or atomic
-train_steps=20000 #20000 for event2mind and 40000 for atomic
-num_evidence=45
+train_steps=20000 #20000 for event2mind and 50000 for atomic
+num_evidence=20
 mkdir -p log model/$task
 CUDA_VISIBLE_DEVICES=0,1,2,3 python run.py \
 --model_name_or_path gpt2 \
