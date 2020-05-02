@@ -151,7 +151,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python run.py \
 --max_event_length 64 \
 --max_target_length 32 \
 --num_evidence $num_evidence \
---eval_steps 2000 \
+--eval_steps 1000 \
 --train_batch_size 64 \
 --eval_batch_size 128 \
 --learning_rate 5e-5 \
