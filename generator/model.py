@@ -38,9 +38,55 @@ class Model(nn.Module):
         self.max_length=args.max_target_length
         self.sos_id=sos_id
         self.eos_id=eos_id
-        self.lm_head.weight=self.decoder.wte.weight       
+        self.tie_weights()
+
         
-    def forward(self, event_ids,context_ids,target_ids=None,posterior=None,prior=None,topk=None):   
+    def _tie_or_clone_weights(self, first_module, second_module):
+        """ Tie or clone module weights depending of weither we are using TorchScript or not
+        """
+        if self.config.torchscript:
+            first_module.weight = nn.Parameter(second_module.weight.clone())
+        else:
+            first_module.weight = second_module.weight
+                  
+    def tie_weights(self):
+        """ Make sure we are sharing the input and output embeddings.
+            Export to TorchScript can't handle parameter sharing so we are cloning them instead.
+        """
+        self._tie_or_clone_weights(self.lm_head,
+                                   self.decoder.wte)        
+
+    def selecter(self,context_ids,posterior):
+        #obtain latent variable
+        z=self.codebook(posterior).detach()
+        
+        #obtain hidden states of context
+        bs,cx,le=context_ids.shape
+        context_ids_all=context_ids
+        context_ids=context_ids.view(-1,le)
+        c=self.encoder(context_ids)[0][:,-1].view(bs,cx,-1) 
+        
+        # select nearest context 
+        distances = ((c-z[:,None,:])**2).sum(-1)      
+        encoding_indices = torch.argmin(distances, dim=1)
+        encodings = F.one_hot(encoding_indices,cx)
+        c=(c*encodings[:,:,None].float()).sum(1)
+        context_loss = torch.mean((c - z)**2,-1)
+        context_ids=(context_ids.view(bs,cx,le)*encodings[:,:,None].long()).sum(1)  
+        
+        #randomly select context
+        item=[]
+        for i in range(bs):
+            k=-1
+            while k==-1 or k==encoding_indices[i]:
+                k=random.randint(0,cx-1)
+            item.append(context_ids_all[i:i+1,k])
+        context_ids_random=torch.cat(item,0)   
+        
+        return context_ids,context_ids_random
+    
+    def forward(self, event_ids=None,context_ids=None,context_ids_random=None,
+                target_ids=None,posterior=None,prior=None,topk=None):   
         """
             Forward the VQ-VAE model.
             Parameters:
@@ -50,50 +96,32 @@ class Model(nn.Module):
             * `posterior`- posterior distribution function p(z|x,y). 
             * `prior`- prior distribution function p(z|x). 
             * `topK`- using topK latent variables to select evidences. 
-        """        
-        if target_ids is None:
+        """ 
+        if event_ids is None:
+            return self.selecter(context_ids,posterior)        
+        elif target_ids is None:
             return self.gen(event_ids,context_ids,prior,topk)
         
-        #obtain latent variable
-        z=self.codebook(posterior).detach()
-   
-        #obtain hidden states of context
-        bs,cx,le=context_ids.shape
-        context_ids_all=context_ids
-        context_ids=context_ids.view(-1,le)
-        c=self.encoder(context_ids)[0][:,-1].view(bs,cx,-1)
-        
-        # select nearest context 
-        distances = ((c-z[:,None,:])**2).sum(-1)      
-        encoding_indices = torch.argmin(distances, dim=1)
-        encodings = F.one_hot(encoding_indices,cx)
-        c=(c*encodings[:,:,None].float()).sum(1)
+        #calculate context loss
+        z=self.codebook(posterior).detach()        
+        c=self.encoder(context_ids)[0][:,-1]
         context_loss = torch.mean((c - z)**2,-1)
-        context_ids=(context_ids.view(bs,cx,le)*encodings[:,:,None].long()).sum(1)
         
-        #randomly select context
-        item=[]
-        for i in range(bs):
-            k=-1
-            while k==-1 or k==encoding_indices[i]:
-                k=random.randint(0,cx-1)
-            item.append(context_ids_all[i:i+1,k])
-        context_ids_random=torch.cat(item,0) 
         
-        #calculate probability of target given empty context
+        #calculate probability of target given randomly selected context
         inputs_ids=torch.cat((context_ids_random,event_ids,target_ids),-1)
         hidden_states=self.decoder(inputs_ids)[0][:,-target_ids.size(1):]
-        lm_logits = self.lsm(self.lm_head(hidden_states))
-        labels_logits=lm_logits[:,:-1].gather(-1,target_ids[:,1:].unsqueeze(-1))[:,:,0]
+        lm_logits = self.lm_head(hidden_states)
+        labels_logits=self.lsm(lm_logits[:,:-1]).gather(-1,target_ids[:,1:].unsqueeze(-1))[:,:,0]
         active_loss=target_ids.ne(0)[:,1:]
         sm_prob=labels_logits*active_loss.float()
         prob_1=torch.exp(sm_prob.sum(1))    
 
-         #calculate probability of target given selected context
+         #calculate probability of target given selected context by latent variable
         inputs_ids=torch.cat((context_ids,event_ids,target_ids),-1)
         hidden_states=self.decoder(inputs_ids)[0][:,-target_ids.size(1):]        
-        lm_logits = self.lsm(self.lm_head(hidden_states))            
-        labels_logits=lm_logits[:,:-1].gather(-1,target_ids[:,1:].unsqueeze(-1))[:,:,0]
+        lm_logits = self.lm_head(hidden_states)        
+        labels_logits=self.lsm(lm_logits[:,:-1]).gather(-1,target_ids[:,1:].unsqueeze(-1))[:,:,0]
         active_loss=target_ids.ne(0)[:,1:]
         sm_prob=labels_logits*active_loss.float()     
         prob_2=torch.exp(sm_prob.sum(1))  
@@ -122,26 +150,14 @@ class Model(nn.Module):
         context_ids_all=context_ids
         for i in range(event_ids.shape[0]):  
             beam = Beam(self.beam_size,self.sos_id,self.eos_id,prob[i])
-            z=self.codebook.weight[topk_id[i]]
-            
-            ############################################################################    
-            #calculate hidden state of evidences
             context_ids=context_ids_all[i:i+1].repeat(topk,1,1)
-            bs,cx,le=context_ids.shape
-            context_ids=context_ids.view(-1,le)
-            c=self.encoder(context_ids)[0][:,-1].view(bs,cx,-1)
-            
-            #obtain evidence selected by latent variable
-            distances = ((c-z[:,None,:])**2).sum(-1)      
-            encoding_indices = torch.argmin(distances, dim=1)
-            encodings = F.one_hot(encoding_indices,cx)
-            context_ids=(context_ids.view(bs,cx,le)*encodings[:,:,None].long()).sum(1)
+            context_ids,_=self.selecter(context_ids,topk_id[i])
             ############################################################################    
             #concatenate evidence and event to obtain hidden states
             inputs_ids=torch.cat((context_ids,event_ids[i:i+1].repeat(topk,1)),-1)
             transformer_outputs=self.decoder(inputs_ids)
             past_x=[x.repeat(1,self.beam_size,1,1,1) for x in transformer_outputs[1]]
-            z=z.repeat(self.beam_size,1)
+            past_inputs=inputs_ids.repeat(self.beam_size,1)
             ############################################################################  
             
             #beam search

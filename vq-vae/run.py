@@ -83,7 +83,7 @@ def convert_examples_to_features(examples, tokenizer, args,stage=None):
     features = []
     for idx, example in tqdm(enumerate(examples),total=len(examples)) if stage=="training" else  enumerate(examples):
         #event
-        event_tokens = tokenizer.tokenize(example.category+" ### "+example.event+" ### "+example.category)[:args.max_event_length]
+        event_tokens = tokenizer.tokenize(example.event+" ### "+example.category+" ### ")[:args.max_event_length]
         event_ids = tokenizer.convert_tokens_to_ids(event_tokens)
         padding_length = args.max_event_length - len(event_ids)
         event_ids+=[0]*padding_length        

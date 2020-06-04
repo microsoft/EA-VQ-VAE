@@ -81,11 +81,11 @@ class Model(nn.Module):
         vae_loss, z, perplexity, encoding=self.codebook(hidden_xy)
 
         #obtain hiddens of target 
-        transformer_outputs=self.decoder(inputs_embeds=self.decoder.wte(input_ids),z=z)
+        transformer_outputs=self.decoder(input_ids,z=z)
         hidden_states = transformer_outputs[0][:,-target_ids.size(1):]
 
         #calculate loss
-        lm_logits = self.lm_head(hidden_states)
+        lm_logits = self.lm_head(hidden_states+z[:,None,:])
         # Shift so that tokens < n predict n
         active_loss = target_ids[..., 1:].ne(0).view(-1) == 1
         shift_logits = lm_logits[..., :-1, :].contiguous()

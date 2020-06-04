@@ -1,23 +1,5 @@
-# coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Fine-tuning the library models for language modeling on a text file (GPT, GPT-2, BERT, RoBERTa).
-GPT and GPT-2 are fine-tuned using a causal language modeling (CLM) loss while BERT and RoBERTa are fine-tuned
-using a masked language modeling (MLM) loss.
-"""
+# Copyright (c) Microsoft Corporation. 
+# Licensed under the MIT license.
 
 from __future__ import absolute_import
 import os
@@ -35,7 +17,7 @@ from tqdm import tqdm, trange
 from nltk.tokenize import WordPunctTokenizer
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
 from torch.utils.data.distributed import DistributedSampler
-from transformers import AdamW, GPT2Config, GPT2Model, GPT2Tokenizer, get_linear_schedule_with_warmup
+from transformers import AdamW, GPT2Config, GPT2LMHeadModel,GPT2Model, GPT2Tokenizer, get_linear_schedule_with_warmup
 from model import Model
 from nltk.tokenize import WordPunctTokenizer
 from nltk import bleu
@@ -130,7 +112,7 @@ def convert_examples_to_features(examples, tokenizer, args,stage=None):
     features = []
     for idx, example in tqdm(enumerate(examples),total=len(examples)) if stage=="training" else  enumerate(examples):
         #event
-        event_tokens = tokenizer.tokenize(example.category+" ### "+example.event+" ### "+example.category)[:args.max_event_length]
+        event_tokens = tokenizer.tokenize(example.event+" ### "+example.category+" ### ")[:args.max_event_length]
         event_ids = tokenizer.convert_tokens_to_ids(event_tokens)
         padding_length = args.max_event_length - len(event_ids)
         event_ids+=[0]*padding_length        
@@ -242,7 +224,12 @@ def train(args,config,tokenizer,model):
         batch = next(train_dataloader)
         batch = tuple(t.to(args.device) for t in batch)
         event_ids,context_ids,target_ids,posterior = batch
-        (re_loss,context_loss,reward),_,_ = model(event_ids=event_ids,context_ids=context_ids,target_ids=target_ids,posterior=posterior)
+        
+        with torch.no_grad():
+            context_ids,context_ids_random=model(context_ids=context_ids,posterior=posterior)
+        (re_loss,context_loss,reward),_,_ = model(event_ids=event_ids,context_ids=context_ids,
+                                                  context_ids_random=context_ids_random,
+                                                  target_ids=target_ids,posterior=posterior)
 
         # mean() to average on multi-gpu.
         if args.n_gpu > 1:
@@ -306,7 +293,7 @@ def train(args,config,tokenizer,model):
                 result[c+' (bleu,dist1,dist2)']=' '.join([str(x) for x in result[c+' (bleu,dist1,dist2)']])
                 overall_bleu+=bleu
                 overall_dist+=dist
-            overall_bleu=round(overall_bleu/len(category),2)
+            overall_bleu=round(overall_bleu/len(category),1)
             result['Overall (bleu-2,dist1,dist2)']=[overall_bleu,dist1(overall_dist),dist2(overall_dist)]
             result['Overall (bleu-2,dist1,dist2)']=' '.join([str(x) for x in result['Overall (bleu-2,dist1,dist2)']])
             result['global_step']= global_step+1
@@ -357,7 +344,10 @@ def evaluate(args,config,tokenizer,model,filename,num_sample=None):
         batch = tuple(t.to(args.device) for t in batch)
         event_ids,context_ids,target_ids,posterior = batch
         with torch.no_grad():
-            _,tmp_eval_loss,num = model(event_ids=event_ids,context_ids=context_ids,target_ids=target_ids,posterior=posterior)  
+            context_ids,context_ids_random=model(context_ids=context_ids,posterior=posterior)
+            _,tmp_eval_loss,num = model(event_ids=event_ids,context_ids=context_ids,
+                                                  context_ids_random=context_ids_random,
+                                                  target_ids=target_ids,posterior=posterior)  
         eval_loss += tmp_eval_loss.sum().item()
         tokens_num += num.sum().item()
         nb_eval_examples += event_ids.size(0)
@@ -555,7 +545,9 @@ def main():
     encoder = GPT2Model(config=config_encoder)       
     codebook=nn.Embedding(args.z_size,config.n_embd)
     codebook.load_state_dict(torch.load(args.codebook_path))
-    model = Model(encoder,decoder,codebook,config,args,sos_id=2235,eos_id=50256)
+    for n, p in codebook.named_parameters():
+        p.requires_grad=False
+    model = Model(encoder,decoder,codebook,config,args,sos_id=tokenizer.convert_tokens_to_ids(["##"])[0],eos_id=tokenizer.convert_tokens_to_ids(["</s>"])[0])
     if args.load_model_path is not None:
         logger.info("Load model from %s",args.load_model_path)
         model.load_state_dict(torch.load(args.load_model_path))
