@@ -203,11 +203,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python run.py \
 # Cite
 If you find our code useful, please consider citing our paper:
 ```
-@inproceedings{daya2020evidence,
-  title={Evidence-Aware Inferential Text Generation with Vector Quantised Variational AutoEncoder},
-  author={Daya Guo, Duyu Tang, Nan Duan, Jian Yin, Daxin Jiang and Ming Zhou},
-  booktitle={Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics},
-  year={2020}
+@inproceedings{guo-etal-2020-evidence,
+    title = "Evidence-Aware Inferential Text Generation with Vector Quantised Variational {A}uto{E}ncoder",
+    author = "Guo, Daya  and
+      Tang, Duyu  and
+      Duan, Nan  and
+      Yin, Jian  and
+      Jiang, Daxin  and
+      Zhou, Ming",
+    booktitle = "Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics",
+    month = jul,
+    year = "2020",
+    address = "Online",
+    publisher = "Association for Computational Linguistics",
+    url = "https://www.aclweb.org/anthology/2020.acl-main.544",
+    pages = "6118--6129",
 }
 ```
 
